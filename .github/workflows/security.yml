@@ -1,0 +1,183 @@
+name: 🛡️ Security Suite
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '0 6 * * 1' # Weekly Scan at 6h on Monday
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+env:
+  SECURITY_LEVEL: "HIGH"
+  TRIVY_SEVERITY: "CRITICAL,HIGH,MEDIUM"
+  SNYK_ORG: "TECHFACTORY"
+
+jobs:
+  # 🔍 PHASE 1 - SECRETS & CODE QUALITY
+  secrets-and-code:
+    name: "🔍 Secrets & Code Analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        language: [go]
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🕵️‍♂️ Detect Hardcoded Secrets"
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --no-git --verbose --redact --exit-code 1
+          config-path: .gitleaks.toml
+
+      - name: "📝 Code Quality & SAST"
+        uses: github/super-linter@v5
+        env:
+          VALIDATE_ALL_CODEBASE: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_SECRETS: false # Gitleaks le fait déjà
+
+      - name: "📊 Cyclomatic Complexity"
+        uses: actions/setup-go@v5
+        if: matrix.language == 'go'
+        with:
+          go-version: '1.22'
+      
+      - name: "🔍 Go Security Scanner"
+        if: matrix.language == 'go'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          ~/go/bin/govulncheck ./... || true
+          
+          # Complexité cyclomatique
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
+          gocyclo -over 15 . || echo "⚠️ High complexity functions detected"
+
+  # 🐳 PHASE 2 - CONTAINER & DEPENDENCIES
+  container-dependencies:
+    name: "🐳 Container & Dependencies"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        language: [go, node, python, terraform]
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "📦 Dependency Vulnerability Scan"
+        if: matrix.language == 'node'
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --fail-on=upgradable
+
+      - name: "🐳 Container Vulnerability Scan"
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          scan-type: fs
+          severity: ${{ env.TRIVY_SEVERITY }}
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: false
+          exit-code: 1
+
+      - name: "📋 SBOM Generation"
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ github.repository }}:latest
+          output-file: sbom.spdx.json
+      
+      - name: "📤 Upload SBOM Artifact"
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.repository }}
+          path: sbom.spdx.json
+
+      - name: "⚠️ Upload Security Results"
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ☁️ PHASE 3 - INFRASTRUCTURE AS CODE
+  infrastructure-security:
+    name: "☁️ IaC Security"
+    runs-on: ubuntu-latest
+    if: contains(github.repository, 'infra-template')
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🏗️ Terraform Security Scan"
+        uses: aquasecurity/tfsec-action@v1.3.0
+        with:
+          working_directory: ./terraform
+          soft_fail: false
+          format: sarif
+          output: tfsec-results.sarif
+
+      - name: "🔧 Terraform Compliance Check"
+        uses: terraform-linters/tflint@v0.53.2
+        with:
+          args: --init --config .tflint.hcl
+
+      - name: "📊 Upload IaC Security Results"
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-results.sarif
+
+  # 📊 PHASE 4 - SECURITY REPORTING
+  security-reporting:
+    name: "📊 Security Reporting"
+    runs-on: ubuntu-latest
+    needs: [secrets-and-code, container-dependencies, infrastructure-security]
+    if: always()
+    
+    steps:
+      - name: "📋 Generate Security Summary"
+        run: |
+          echo "## 🛡️ Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Date:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "**Overall Status:** ${{ needs.secrets-and-code.result }} | ${{ needs.container-dependencies.result }} | ${{ needs.infrastructure-security.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔍 Findings Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets Detection: ${{ needs.secrets-and-code.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Container Vulnerabilities: ${{ needs.container-dependencies.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- IaC Security: ${{ needs.infrastructure-security.result }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: "🧾 Archive Security Summary"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary-${{ github.repository }}
+          path: $GITHUB_STEP_SUMMARY
+      
+      - name: "🐛 Create GitHub Issue on Failure"
+        if: failure()
+        uses: peter-evans/create-issue-from-file@v4
+        with:
+          title: "🚨 Security Scan Failed"
+          content-filepath: $GITHUB_STEP_SUMMARY
+          labels: security, ci-failure
+      
+      - name: "🔔 Notify Security Team"
+        uses: 8398a7/action-slack@v3
+        if: failure()
+        with:
+          status: failure
+          text: |
+            🚨 Security Scan Failed for ${{ github.repository }}
+            Check the security report for details
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SECURITY_SLACK_WEBHOOK }}

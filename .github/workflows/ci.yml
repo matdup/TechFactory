@@ -1,0 +1,334 @@
+name: 🛡️ CI/CD
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '0 6 * * 1' # Weekly Security Scan
+
+# 🔐 SECURITY - Protected critical Variables
+env:
+  DOCKER_IMAGE: ghcr.io/${{ github.repository }}
+  TRIVY_SEVERITY: CRITICAL,HIGH,MEDIUM
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+jobs:
+  # 🔍 PHASE 1 - VALIDATION & SECURITY
+  validation:
+    name: "🔍 Validation & Linting"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🛡️ Detect Secrets"
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          exit-code: 1
+
+      - name: "📝 Code Quality Analysis"
+        uses: github/super-linter@v5
+        env:
+          VALIDATE_ALL_CODEBASE: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "🔎 Detect Project Language"
+        id: detect-lang
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "lang=go" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            echo "lang=node" >> $GITHUB_OUTPUT
+          elif [ -f "terraform/main.tf" ]; then
+            echo "lang=terraform" >> $GITHUB_OUTPUT
+          else
+            echo "lang=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "🔧 Language-Specific Validation"
+        id: validate
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "🔷 Go Project Detected"
+            go mod verify
+            go vet ./...
+            staticcheck ./...
+          elif [ -f "package.json" ]; then
+            echo "🟨 Node.js Project Detected" 
+            npm ci --audit --fund=false
+            npm run lint --if-present
+            npx license-checker --summary
+          elif [ -f "terraform/main.tf" ]; then
+            echo "🟧 Terraform Project Detected"
+            cd terraform
+            terraform validate
+            terraform fmt -check
+            tflint --init && tflint
+          fi
+
+  # 🧪 PHASE 2 - TESTING
+  testing:
+    name: "🧪 Comprehensive Testing"
+    runs-on: ubuntu-latest
+    needs: validation
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+        go-version: [1.21, 1.22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔎 Detect Project Language"
+        id: detect-lang-testing
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "lang=go" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            echo "lang=node" >> $GITHUB_OUTPUT
+          elif [ -f "terraform/main.tf" ]; then
+            echo "lang=terraform" >> $GITHUB_OUTPUT
+          elif [ -f "mkdocs.yml" ]; then
+            echo "lang=docs" >> $GITHUB_OUTPUT
+          else
+            echo "lang=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "🟦 Go Testing Matrix"
+        if: steps.detect-lang-testing.outputs.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      
+      - name: "🟨 Node.js Testing Matrix"
+        if: steps.detect-lang-testing.outputs.lang == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: "🧪 Run Test Suite"
+        run: |
+          if [ -f "go.mod" ]; then
+            go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+            go tool cover -html=coverage.out -o coverage.html
+          elif [ -f "package.json" ]; then
+            npm test -- --coverage --watchAll=false
+            npm run test:e2e --if-present
+          elif [ -f "terraform/main.tf" ]; then
+            cd terraform
+            terraform init -backend=false
+            terraform validate
+            terraform plan -no-color
+          fi
+
+      - name: "📊 Upload Coverage"
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+
+      - name: "📤 Upload Coverage Artifact"
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.repository }}
+          path: coverage.html
+
+  # 🏗️ PHASE 3 - BUILD & SECURITY SCAN
+  build:
+    name: "🏗️ Build "
+    runs-on: ubuntu-latest
+    needs: testing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🧱 Cache Docker layers"
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: "🐳 Build Docker Image"
+        run: |
+          docker build \
+            --tag $DOCKER_IMAGE:${{ github.sha }} \
+            --tag $DOCKER_IMAGE:latest \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            .
+
+      - name: "📤 Push to GHCR"
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: "🚀 Push Image"
+        if: github.ref == 'refs/heads/main'
+        run: docker push $DOCKER_IMAGE:${{ github.sha }}
+
+  security-scan:
+    name: "🏗️ Security Scan"
+    runs-on: ubuntu-latest
+    needs: testing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🧱 Cache Docker layers"
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: "🐳 Build Docker Image"
+        run: |
+          docker build \
+            --tag $DOCKER_IMAGE:${{ github.sha }} \
+            --tag $DOCKER_IMAGE:latest \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            .
+
+      - name: "🛡️ Container Vulnerability Scan"
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: $DOCKER_IMAGE:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: 1
+
+      - name: "📦 SBOM Generation"
+        uses: anchore/sbom-action@v0
+        with:
+          image: $DOCKER_IMAGE:${{ github.sha }}
+          output-file: sbom.spdx.json
+      
+      - name: "📤 Upload SBOM Artifact"
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.repository }}
+          path: sbom.spdx.json
+
+      - name: "⚠️ Upload Security Results"
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: "📤 Push to GHCR"
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: "🚀 Push Image"
+        if: github.ref == 'refs/heads/main'
+        run: docker push $DOCKER_IMAGE:${{ github.sha }}
+      
+      - name: "🧹 Clean Docker Cache"
+        if: always()
+        run: docker system prune -af
+  
+
+  # 🚀 PHASE 4 - DEPLOYMENT
+  deployment:
+    name: "🚀 Smart Deployment"
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.ref == 'refs/heads/main'
+    environment: 
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🏗️ Infrastructure Deployment"
+        if: contains(github.repository, 'infra-template')
+        run: |
+          cd terraform
+          echo "${{ secrets.OVH_TERRAFORM_BACKEND }}" > backend.tfvars
+          terraform init -backend-config=backend.tfvars
+          terraform plan -var="ovh_project_id=${{ secrets.OVH_PROJECT_ID }}"
+          terraform apply -auto-approve
+
+      - name: "📦 Application Deployment"
+        if: contains(github.repository, 'backend-template') || contains(github.repository, 'frontend-template')
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            docker pull $DOCKER_IMAGE:${{ github.sha }}
+            docker-compose down
+            docker-compose up -d
+            docker system prune -f
+
+      - name: "📚 Docs Deployment"
+        if: contains(github.repository, 'docs-template')
+        run: |
+          pip install mkdocs-material
+          mkdocs gh-deploy --force
+
+  # 📊 PHASE 5 - MONITORING & NOTIFICATION
+  monitoring:
+    name: "📊 Post-Deployment Validation"
+    runs-on: ubuntu-latest
+    needs: deployment
+    if: always()
+
+    steps:
+      - name: "🩺 Health Check"
+        if: needs.deployment.result == 'success'
+        run: |
+          echo "Running comprehensive health checks..."
+          # Health checks spécifiques au projet
+          if [ -f "health-check.sh" ]; then
+            chmod +x health-check.sh
+            ./health-check.sh
+          fi
+
+      - name: "📈 Performance Metrics"
+        if: needs.deployment.result == 'success'
+        run: |
+          echo "Collecting deployment metrics..."
+          echo "Deployment Time: $(date -u)" >> metrics.md
+          echo "Commit: ${{ github.sha }}" >> metrics.md
+          echo "Duration: $((SECONDS / 60)) minutes" >> metrics.md
+
+      - name: "🔔 Notify Slack"
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 🚀 Deployment ${{ job.status }} for ${{ github.repository }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: "📋 Summary Report"
+        if: always()
+        run: |
+          echo "## 🛡️ CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Duration:** ${{ needs.deployment.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Security Scan:** ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
