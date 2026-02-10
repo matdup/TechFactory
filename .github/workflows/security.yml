@@ -1,0 +1,261 @@
+name: 🛡️ Security Suite
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '0 6 * * 1' # Weekly Scan Monday 06:00 UTC
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  packages: read        # required if pulling GHCR images (private repos)
+
+env:
+  SECURITY_LEVEL: "HIGH"
+  TRIVY_SEVERITY: "CRITICAL,HIGH,MEDIUM"
+  SNYK_ORG: "TECHFACTORY"
+
+jobs:
+  # 🔍 PHASE 1 - SECRETS & CODE QUALITY
+  secrets-and-code:
+    name: "🔍 Secrets & Code Analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: "🔎 Detect gitleaks config"
+        id: gitleaks_cfg
+        shell: bash
+        run: |
+          if [ -f ".gitleaks.toml" ]; then echo "has_cfg=true" >> "$GITHUB_OUTPUT"; else echo "has_cfg=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: "🕵️‍♂️ Gitleaks (Secrets) - with config"
+        if: steps.gitleaks_cfg.outputs.has_cfg == 'true'
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --verbose --redact --exit-code 1
+          config-path: .gitleaks.toml
+
+      - name: "🕵️‍♂️ Gitleaks (Secrets) - default"
+        if: steps.gitleaks_cfg.outputs.has_cfg != 'true'
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --verbose --redact --exit-code 1
+
+      - name: "📝 Super-Linter (SAST-lite)"
+        uses: github/super-linter@v5
+        env:
+          VALIDATE_ALL_CODEBASE: true
+          VALIDATE_SECRETS: false
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "🧰 Setup Go (only if go.mod exists)"
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: "🔍 govulncheck + cyclomatic complexity"
+        if: hashFiles('go.mod') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pin versions (portfolio-grade reproducibility)
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.3
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+
+          echo "== govulncheck =="
+          # HIGH security => fail on findings
+          govulncheck ./...
+
+          echo "== gocyclo (threshold 15) =="
+          gocyclo -over 15 . && echo "⚠️ High complexity functions detected (review recommended)" || true
+
+  # 🐳 PHASE 2 - CONTAINER & DEPENDENCIES
+  container-and-deps:
+    name: "🐳 Container & Dependencies"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔎 Detect project files"
+        id: detect
+        shell: bash
+        run: |
+          if [ -f "Dockerfile" ]; then echo "has_docker=true" >> "$GITHUB_OUTPUT"; else echo "has_docker=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -f "package.json" ]; then echo "has_node=true" >> "$GITHUB_OUTPUT"; else echo "has_node=false" >> "$GITHUB_OUTPUT"; fi
+      
+      - name: "🔐 Detect Snyk token"
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.SNYK_TOKEN }}" ]; then
+            echo "HAS_SNYK_TOKEN=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_SNYK_TOKEN=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: "🟨 Snyk (Node dependencies)"
+        if: steps.detect.outputs.has_node == 'true' && env.HAS_SNYK_TOKEN == 'true'
+        uses: snyk/actions/node@0.4.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --fail-on=upgradable --org=${{ env.SNYK_ORG }}
+
+      - name: "ℹ️ No SNYK_TOKEN — skipping Snyk"
+        if: steps.detect.outputs.has_node == 'true' && env.HAS_SNYK_TOKEN != 'true'
+        run: echo "No SNYK_TOKEN configured. Skipping Snyk dependency scan."
+
+      - name: "🧰 Set up Docker Buildx"
+        if: steps.detect.outputs.has_docker == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: "🐳 Build image (local)"
+        if: steps.detect.outputs.has_docker == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: local/security-scan:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "🛡️ Trivy (image vulnerabilities)"
+        if: steps.detect.outputs.has_docker == 'true'
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          image-ref: local/security-scan:${{ github.sha }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          exit-code: 1
+
+      - name: "📦 SBOM Generation (same image)"
+        if: steps.detect.outputs.has_docker == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: local/security-scan:${{ github.sha }}
+          output-file: sbom.spdx.json
+
+      - name: "📤 Upload SBOM Artifact"
+        if: steps.detect.outputs.has_docker == 'true' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.repository }}-${{ github.sha }}
+          path: sbom.spdx.json
+
+      - name: "⚠️ Upload Trivy SARIF"
+        if: steps.detect.outputs.has_docker == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: "ℹ️ No Dockerfile — skipping container scan"
+        if: steps.detect.outputs.has_docker != 'true'
+        run: echo "No Dockerfile found. Skipping image build, Trivy scan, and SBOM."
+
+  # ☁️ PHASE 3 - INFRASTRUCTURE AS CODE
+  infrastructure-security:
+    if: contains(github.repository, 'infra-template') && hashFiles('terraform/**/*.tf') != ''
+    name: "☁️ IaC Security"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🧰 Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: "🧰 Setup TFLint"
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.2
+
+      - name: "🔧 TFLint"
+        working-directory: terraform
+        run: |
+          tflint --init
+          tflint
+
+      - name: "🏗️ tfsec (Terraform security)"
+        uses: aquasecurity/tfsec-action@v1.3.0
+        with:
+          working_directory: ./terraform
+          soft_fail: false
+          format: sarif
+          output: tfsec-results.sarif
+
+      - name: "⚠️ Upload tfsec SARIF"
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-results.sarif
+
+  # 📊 PHASE 4 - SECURITY REPORTING
+  security-reporting:
+    name: "📊 Security Reporting"
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write         # required for create-issue-from-file
+      contents: read
+    needs: [secrets-and-code, container-and-deps, infrastructure-security]
+    if: always()
+    steps:
+      - name: "📋 Generate Security Summary"
+        shell: bash
+        run: |
+          echo "## 🛡️ Security Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Repository:** ${{ github.repository }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Scan Date:** $(date -u)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Results:**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Secrets & Code: ${{ needs.secrets-and-code.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Container & Deps: ${{ needs.container-and-deps.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- IaC: ${{ needs.infrastructure-security.result || 'skipped' }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "🧾 Archive Security Summary"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary-${{ github.repository }}-${{ github.sha }}
+          path: ${{ github.step_summary }}
+
+      - name: "🐛 Create GitHub Issue on Failure"
+        if: failure()
+        uses: peter-evans/create-issue-from-file@v4
+        with:
+          title: "🚨 Security Scan Failed"
+          content-filepath: ${{ github.step_summary }}
+          labels: security, ci-failure
+      
+      - name: "🔐 Detect security slack webhook"
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.SECURITY_SLACK_WEBHOOK }}" ]; then
+            echo "HAS_SECURITY_SLACK=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_SECURITY_SLACK=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: "🔔 Notify Security Team (Slack)"
+        if: failure() && env.HAS_SECURITY_SLACK == 'true'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            🚨 Security Scan Failed for ${{ github.repository }}
+            Check Actions + Security tab for details.
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SECURITY_SLACK_WEBHOOK }}

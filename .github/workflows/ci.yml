@@ -1,0 +1,465 @@
+name: 🛡️ CI/CD
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '0 6 * * 1' # Weekly Security Scan
+
+# 🔐 SECURITY - Protected critical Variables
+env:
+  DOCKER_IMAGE: ghcr.io/${{ github.repository }}
+  TRIVY_SEVERITY: CRITICAL,HIGH,MEDIUM
+
+jobs:
+  # 🔍 PHASE 1 - VALIDATION & SECURITY
+  validation:
+    name: "🔍 Validation & Linting"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "🔎 Detect Project Language"
+        id: detect-lang
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "lang=go" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            echo "lang=node" >> $GITHUB_OUTPUT
+          elif find . -name "*.tf" -print -quit | grep -q .; then
+            echo "lang=terraform" >> $GITHUB_OUTPUT
+          else
+            echo "lang=unknown" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: "🧰 Setup Go"
+        if: steps.detect-lang.outputs.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+        
+      - name: "🧰 Setup Terraform"
+        if: steps.detect-lang.outputs.lang == 'terraform'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: "🧰 Setup TFLint"
+        if: steps.detect-lang.outputs.lang == 'terraform'
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.2
+
+      - name: "🛡️ Detect Secrets"
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          exit-code: 1
+
+      - name: "📝 Code Quality Analysis"
+        uses: github/super-linter@v5
+        env:
+          VALIDATE_ALL_CODEBASE: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "🔧 Language-Specific Validation"
+        id: validate
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "🔷 Go Project Detected"
+            go mod verify
+            go vet ./...
+            go install honnef.co/go/tools/cmd/staticcheck@v0.5.1
+            staticcheck ./...
+          elif [ -f "package.json" ]; then
+            echo "🟨 Node.js Project Detected" 
+            npm ci --audit --fund=false
+            npm run lint --if-present
+            npx license-checker --summary
+          elif find . -name "*.tf" -print -quit | grep -q .; then
+            echo "🟧 Terraform Project Detected"
+            terraform fmt -check -recursive
+            terraform init -backend=false
+            terraform validate
+            tflint --init && tflint
+          fi
+
+  # 🧪 PHASE 2 - TESTING
+  testing:
+    name: "🧪 Comprehensive Testing"
+    runs-on: ubuntu-latest
+    needs: validation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lang: go
+            go-version: 1.21
+          - lang: go
+            go-version: 1.22
+          - lang: node
+            node-version: 18.x
+          - lang: node
+            node-version: 20.x
+          - lang: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔎 Detect Project Language"
+        id: detect-lang-testing
+        run: |
+          if [ -f "go.mod" ]; then
+            echo "lang=go" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            echo "lang=node" >> $GITHUB_OUTPUT
+          elif find . -name "*.tf" -print -quit | grep -q .; then
+            echo "lang=terraform" >> "$GITHUB_OUTPUT"
+          elif [ -f "mkdocs.yml" ]; then
+            echo "lang=docs" >> $GITHUB_OUTPUT
+          else
+            echo "lang=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "🧯 Non-matching matrix entry (noop)"
+        if: matrix.lang != steps.detect-lang-testing.outputs.lang
+        run: echo "Noop: matrix.lang=${{ matrix.lang }} / repo.lang=${{ steps.detect-lang-testing.outputs.lang }}"
+      
+      - name: "🧰 Setup Terraform"
+        if: steps.detect-lang-testing.outputs.lang == 'terraform'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: "🟦 Setup Go"
+        if: matrix.lang == 'go' && steps.detect-lang-testing.outputs.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: "🟨 Setup Node"
+        if: matrix.lang == 'node' && steps.detect-lang-testing.outputs.lang == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: "🧪 Run Go Tests"
+        if: matrix.lang == 'go' && steps.detect-lang-testing.outputs.lang == 'go'
+        run: |
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: "🧪 Run Node Tests"
+        if: matrix.lang == 'node' && steps.detect-lang-testing.outputs.lang == 'node'
+        run: |
+          npm test -- --coverage --watchAll=false
+          npm run test:e2e --if-present
+
+      - name: "🧪 Run Terraform Validation"
+        if: matrix.lang == 'terraform' && steps.detect-lang-testing.outputs.lang == 'terraform'
+        run: |
+          terraform init -backend=false
+          terraform validate
+          terraform plan -no-color
+
+      - name: "📊 Upload Coverage"
+        if: matrix.lang == 'go' && steps.detect-lang-testing.outputs.lang == 'go' && hashFiles('coverage.out') != ''
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.out
+
+      - name: "📤 Upload Coverage Artifact"
+        if: matrix.lang == 'go' && steps.detect-lang-testing.outputs.lang == 'go' && hashFiles('coverage.html') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.repository }}
+          path: coverage.html
+
+  # 🏗️ PHASE 3 - BUILD & SECURITY SCAN
+  build:
+    name: "🏗️ Build "
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs: testing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔎 Detect Dockerfile"
+        id: docker
+        run: |
+          if [ -f "Dockerfile" ]; then echo "has_docker=true" >> $GITHUB_OUTPUT; else echo "has_docker=false" >> $GITHUB_OUTPUT; fi
+
+      - name: "🧰 Set up Docker Buildx"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: docker/setup-buildx-action@v3
+      
+      - name: "📤 Login to GHCR"
+        if: steps.docker.outputs.has_docker == 'true' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "🐳 Build Docker Image and Push on main"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+            ${{ env.DOCKER_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  security-scan:
+    name: "🏗️ Security Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    needs: testing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔎 Detect Dockerfile"
+        id: docker
+        run: |
+          if [ -f "Dockerfile" ]; then echo "has_docker=true" >> $GITHUB_OUTPUT; else echo "has_docker=false" >> $GITHUB_OUTPUT; fi
+
+      - name: "🧰 Set up Docker Buildx"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: "🐳 Build Docker Image (local for scan)"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: local/scan:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "🛡️ Container Vulnerability Scan"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: local/scan:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: 1
+
+      - name: "📦 SBOM Generation"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: local/scan:${{ github.sha }}
+          output-file: sbom.spdx.json
+      
+      - name: "📤 Upload SBOM Artifact"
+        if: steps.docker.outputs.has_docker == 'true' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.repository }}
+          path: sbom.spdx.json
+
+      - name: "⚠️ Upload Security Results"
+        if: steps.docker.outputs.has_docker == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+      
+      - name: "ℹ️ No Dockerfile — skipping container security scan"
+        if: steps.docker.outputs.has_docker != 'true'
+        run: echo "No Dockerfile found. Skipping image build, Trivy scan, and SBOM."
+
+  # 🚀 PHASE 4 - DEPLOYMENT
+  deployment:
+    name: "🚀 Smart Deployment"
+    concurrency:
+      group: infra-production
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [build, security-scan]
+    if: github.ref == 'refs/heads/main'
+    environment: 
+      name: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "✅ Preflight (required secrets for infra)"
+        if: contains(github.repository, 'infra-template')
+        run: |
+          set -e
+          test -n "${{ secrets.OVH_PROJECT_ID }}" || (echo "Missing secret: OVH_PROJECT_ID" && exit 1)
+          test -n "${{ secrets.OVH_TERRAFORM_BACKEND }}" || (echo "Missing secret: OVH_TERRAFORM_BACKEND" && exit 1)
+          test -n "${{ secrets.OVH_ENDPOINT }}" || (echo "Missing secret: OVH_ENDPOINT" && exit 1)
+          test -n "${{ secrets.OVH_APPLICATION_KEY }}" || (echo "Missing secret: OVH_APPLICATION_KEY" && exit 1)
+          test -n "${{ secrets.OVH_APPLICATION_SECRET }}" || (echo "Missing secret: OVH_APPLICATION_SECRET" && exit 1)
+          test -n "${{ secrets.OVH_CONSUMER_KEY }}" || (echo "Missing secret: OVH_CONSUMER_KEY" && exit 1)
+      
+      - name: "✅ Preflight (required secrets for app deploy)"
+        if: contains(github.repository, 'backend-template') || contains(github.repository, 'frontend-template')
+        run: |
+          set -e
+          test -n "${{ secrets.SSH_HOST }}" || (echo "Missing secret: SSH_HOST" && exit 1)
+          test -n "${{ secrets.SSH_USER }}" || (echo "Missing secret: SSH_USER" && exit 1)
+          test -n "${{ secrets.SSH_PRIVATE_KEY }}" || (echo "Missing secret: SSH_PRIVATE_KEY" && exit 1)
+
+      - name: "🧰 Setup Terraform"
+        if: contains(github.repository, 'infra-template')
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: "🏗️ Infrastructure Deployment"
+        if: contains(github.repository, 'infra-template')
+        env:
+          TF_IN_AUTOMATION: "true"
+          TF_INPUT: "false"
+          TF_VAR_ovh_project_id: ${{ secrets.OVH_PROJECT_ID }}
+          OVH_ENDPOINT: ${{ secrets.OVH_ENDPOINT }}
+          OVH_APPLICATION_KEY: ${{ secrets.OVH_APPLICATION_KEY }}
+          OVH_APPLICATION_SECRET: ${{ secrets.OVH_APPLICATION_SECRET }}
+          OVH_CONSUMER_KEY: ${{ secrets.OVH_CONSUMER_KEY }}
+        run: |
+          echo "${{ secrets.OVH_TERRAFORM_BACKEND }}" > backend.tfvars
+          terraform init -backend-config=backend.tfvars
+          terraform fmt -check -recursive
+          terraform validate
+          terraform plan -no-color -out=tfplan
+          terraform show -json tfplan > tfplan.json
+
+          python - << 'PY'
+          import json, sys
+          j=json.load(open("tfplan.json"))
+          destroy=0
+          for rc in j.get("resource_changes",[]):
+              actions=rc.get("change",{}).get("actions",[])
+              if "delete" in actions:
+                  destroy += 1
+          if destroy:
+              print(f"❌ Blocking: {destroy} destroy action(s) detected.")
+              sys.exit(1)
+          print("✅ No destroy actions detected.")
+          PY
+      
+      - name: "📦 Upload Terraform Plan"
+        if: contains(github.repository, 'infra-template')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: |
+            tfplan
+            tfplan.json
+      
+      - name: "⬇️ Download Terraform Plan (audit-friendly)"
+        if: contains(github.repository, 'infra-template')
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: artifact/terraform
+
+      - name: "🚀 Terraform Apply"
+        if: contains(github.repository, 'infra-template')
+        env:
+          TF_IN_AUTOMATION: "true"
+          TF_INPUT: "false"
+          TF_VAR_ovh_project_id: ${{ secrets.OVH_PROJECT_ID }}
+          OVH_ENDPOINT: ${{ secrets.OVH_ENDPOINT }}
+          OVH_APPLICATION_KEY: ${{ secrets.OVH_APPLICATION_KEY }}
+          OVH_APPLICATION_SECRET: ${{ secrets.OVH_APPLICATION_SECRET }}
+          OVH_CONSUMER_KEY: ${{ secrets.OVH_CONSUMER_KEY }}
+        run: |
+          echo "${{ secrets.OVH_TERRAFORM_BACKEND }}" > backend.tfvars
+          terraform init -backend-config=backend.tfvars
+          terraform apply -auto-approve ../artifact/terraform/tfplan
+
+      - name: "📦 Application Deployment"
+        if: contains(github.repository, 'backend-template') || contains(github.repository, 'frontend-template')
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            docker pull $DOCKER_IMAGE:${{ github.sha }}
+            docker compose pull
+            docker compose up -d --remove-orphans
+            docker image prune -f
+
+      - name: "📚 Docs Deployment"
+        if: contains(github.repository, 'docs-template')
+        run: |
+          pip install mkdocs-material
+          mkdocs gh-deploy --force
+
+  # 📊 PHASE 5 - MONITORING & NOTIFICATION
+  monitoring:
+    name: "📊 Post-Deployment Validation"
+    runs-on: ubuntu-latest
+    needs: deployment
+    if: github.ref == 'refs/heads/main' && always()
+
+    steps:
+      - name: "🩺 Health Check"
+        if: needs.deployment.result == 'success'
+        run: |
+          echo "Running comprehensive health checks..."
+          if [ -f "health-check.sh" ]; then
+            chmod +x health-check.sh
+            ./health-check.sh
+          else
+            echo "No health-check.sh found, skipping."
+          fi
+
+      - name: "🧾 Deployment failed — skipping health checks"
+        if: needs.deployment.result == 'failure'
+        run: echo "Deployment failed; skipping health checks."
+
+      - name: "📈 Performance Metrics"
+        if: needs.deployment.result == 'success'
+        run: |
+          echo "Collecting deployment metrics..."
+          echo "Deployment Time: $(date -u)" >> metrics.md
+          echo "Commit: ${{ github.sha }}" >> metrics.md
+          echo "Duration: $((SECONDS / 60)) minutes" >> metrics.md
+
+      - name: "🔔 Notify Slack"
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 🚀 Deployment ${{ job.status }} for ${{ github.repository }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: "📋 Summary Report"
+        if: always()
+        run: |
+          echo "## 🛡️ CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Duration:** ${{ needs.deployment.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Security Scan:** ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
